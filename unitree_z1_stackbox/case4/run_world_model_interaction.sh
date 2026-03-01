@@ -20,5 +20,8 @@ dataset="unitree_z1_stackbox"
         --n_iter 12 \
         --timestep_spacing 'uniform_trailing' \
         --guidance_rescale 0.7 \
-        --perframe_ae
+        --perframe_ae \
+        # --use_deepcache \
+        # --deepcache_interval 3 \
+        # --deepcache_branch_id 3
 } 2>&1 | tee "${res_dir}/output.log"

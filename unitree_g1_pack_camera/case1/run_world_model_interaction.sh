@@ -19,6 +19,8 @@ dataset="unitree_g1_pack_camera"
         --exe_steps 16 \
         --n_iter 11 \
         --timestep_spacing 'uniform_trailing' \
-        --guidance_rescale 0.7 \
-        --perframe_ae
+        --guidance_rescale 0.7 
+        # --use_deepcache \
+        # --deepcache_interval 3 \
+        # --deepcache_branch_id 2
 } 2>&1 | tee "${res_dir}/output.log"
