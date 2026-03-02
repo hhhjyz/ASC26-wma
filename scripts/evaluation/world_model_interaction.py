@@ -47,8 +47,15 @@ _ITER_OVERRIDE = os.environ.get("WMA_ITER_OVERRIDE", "")
 _USE_TORCH_COMPILE = os.environ.get("WMA_TORCH_COMPILE", "0") == "1"
 # Action 步骤单独的 ddim_steps
 _ACTION_DDIM_STEPS = os.environ.get("WMA_ACTION_DDIM_STEPS", "")
-# FP16 推理开关 (默认启用，设置为 0 可禁用以提高精度)
-_USE_FP16 = os.environ.get("WMA_USE_FP16", "1") == "1"
+# ── Cast 模式选择 ──
+# WMA_CAST_MODE=v1  → 旧版: model.cuda() 在 data.setup() 之前, 仅 autocast, 无 model.half()
+# WMA_CAST_MODE=v2  → 新版: model.cuda() 在 data.setup() 之后, 支持 model.half() + autocast
+_CAST_MODE = os.environ.get("WMA_CAST_MODE", "v2")
+# FP16 autocast 推理开关
+_USE_FP16 = os.environ.get("WMA_FP16", os.environ.get("WMA_USE_FP16", "0")) == "1"
+# FP16 模型权重 casting 策略 (仅 v2 模式 + _USE_FP16=True 时有效)
+_FORCE_FULL_FP16 = os.environ.get("WMA_FORCE_FULL_FP16", "0") == "1"
+_FORCE_FP16_DIFFUSION_ONLY = os.environ.get("WMA_FORCE_FP16_DIFFUSION_ONLY", "0") == "1"
 
 
 # ===================== 优化: StageTimer =====================
@@ -176,17 +183,15 @@ class InferenceTimer:
 _PERF_TIMER = InferenceTimer(_PROFILING_ENABLED)
 
 
-@contextlib.contextmanager
-def optional_autocast():
+def _build_autocast_ctx():
     """
-    可选的 FP16 autocast 上下文管理器
-    通过 WMA_USE_FP16 环境变量控制
+    构建 FP16 autocast 上下文管理器 (与 asc26-wma-opt 参考代码对齐)
+    通过 WMA_FP16 / WMA_USE_FP16 环境变量控制
     """
     if _USE_FP16:
-        with torch.autocast(device_type="cuda", dtype=torch.float16):
-            yield
+        return torch.autocast(device_type="cuda", dtype=torch.float16)
     else:
-        yield
+        return contextlib.nullcontext()
 
 
 @contextlib.contextmanager
@@ -795,11 +800,24 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int,
     global _PERF_TIMER
     _PERF_TIMER = InferenceTimer(_PROFILING_ENABLED)
     
+    print(f">>> Cast mode: {_CAST_MODE}")
+    
     # ===================== 优化: CUDA 后端设置 =====================
-    # 注意: TF32 默认关闭以保证 PSNR 与 baseline 一致
-    # 如需加速可设置 WMA_ENABLE_TF32=1，但可能轻微影响 PSNR
-    enable_tf32 = os.environ.get("WMA_ENABLE_TF32", "0") == "1"
-    cudnn_benchmark = os.environ.get("WMA_CUDNN_BENCHMARK", "1") == "1"
+    if _CAST_MODE == "v1":
+        # v1: 旧版默认值
+        enable_tf32 = os.environ.get("WMA_ENABLE_TF32", "0") == "1"
+        cudnn_benchmark = os.environ.get("WMA_CUDNN_BENCHMARK", "1") == "1"
+    else:
+        # v2: 与 asc26-wma-opt 参考代码对齐
+        enable_tf32 = os.environ.get("WMA_ENABLE_TF32", "1") == "1"
+        cudnn_benchmark = os.environ.get("WMA_CUDNN_BENCHMARK", "0") == "1"
+
+    # FP16 参数验证
+    if _FORCE_FULL_FP16 and _FORCE_FP16_DIFFUSION_ONLY:
+        raise ValueError("WMA_FORCE_FULL_FP16 and WMA_FORCE_FP16_DIFFUSION_ONLY are mutually exclusive.")
+    if (_FORCE_FULL_FP16 or _FORCE_FP16_DIFFUSION_ONLY) and not _USE_FP16:
+        logging.warning("WMA_FORCE_FULL_FP16 / WMA_FORCE_FP16_DIFFUSION_ONLY is set but WMA_FP16 is not enabled; ignoring.")
+    print(f">>> FP16 config: autocast={_USE_FP16}, force_full={_FORCE_FULL_FP16}, diffusion_only={_FORCE_FP16_DIFFUSION_ONLY}")
     
     if torch.cuda.is_available():
         # TF32 加速 (A100/RTX30xx+ 支持, 默认关闭以保证精度)
@@ -844,8 +862,10 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int,
         print(f">>> Action 分支 ddim_steps: {action_ddim_steps}")
 
     # 模型加载 (支持缓存复用)
+    preloaded_to_gpu = False
     if cached_model is not None:
         model = cached_model
+        preloaded_to_gpu = next(model.parameters()).device.type == 'cuda'
         print(f'>>> 复用已加载的模型实例')
     else:
         startup_timer = StageTimer("init")
@@ -904,13 +924,14 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int,
         model = load_model_checkpoint(model, ckpt_path, map_location=ckpt_map_location)
         startup_timer.mark("load_checkpoint")
         
-        # ── Step 4: 搬到 GPU (如果还没在 GPU 上) ──
-        if not preloaded_to_gpu:
-            print(f'>>> 模型移动到 GPU {gpu_no}...')
-            model = model.cuda(gpu_no)
-            startup_timer.mark("move_model_to_gpu")
-        else:
-            startup_timer.mark("model_already_on_gpu")
+        if _CAST_MODE == "v1":
+            # v1: 旧版流程 — model.cuda() 在 checkpoint 加载后立即执行
+            if not preloaded_to_gpu:
+                print(f'>>> 模型移动到 GPU {gpu_no}...')
+                model = model.cuda(gpu_no)
+                startup_timer.mark("move_model_to_gpu")
+            else:
+                startup_timer.mark("model_already_on_gpu")
         
         model.eval()
         
@@ -934,10 +955,33 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int,
         data.setup()
         print(">>> Dataset is successfully loaded ...")
 
-    # 如果还没移到 GPU，现在移动
-    if next(model.parameters()).device.type == 'cpu':
-        model = model.cuda(gpu_no)
+    if _CAST_MODE == "v1":
+        # v1: 旧版 — 模型已经在 GPU 上，仅检查兜底
+        if next(model.parameters()).device.type == 'cpu':
+            model = model.cuda(gpu_no)
+    else:
+        # v2: 新版 — model.cuda() 在 data.setup() 之后
+        # data.setup() 内部调用 seed_everything(123) 重置 RNG，
+        # 之后 model.cuda() 消耗 CUDA RNG 的序列与参考代码完全对齐。
+        if not preloaded_to_gpu:
+            print(f'>>> 模型移动到 GPU {gpu_no}...')
+            model = model.cuda(gpu_no)
+        else:
+            # 即使已在 GPU 上，也调用 .cuda() 保持与参考代码一致的 RNG 消耗
+            model = model.cuda(gpu_no)
+
+    # ── FP16 权重 casting (v2 模式下与 asc26-wma-opt 参考代码对齐) ──
+    if _FORCE_FULL_FP16 and _USE_FP16:
+        model = model.half()
+        print('>>> WMA_FORCE_FULL_FP16: 整个模型权重已转为 fp16')
+    elif _FORCE_FP16_DIFFUSION_ONLY and _USE_FP16:
+        model.model = model.model.half()
+        print('>>> WMA_FORCE_FP16_DIFFUSION_ONLY: diffusion wrapper 权重已转为 fp16')
+
     device = get_device_from_parameters(model)
+
+    # 创建 autocast 上下文
+    autocast_ctx = _build_autocast_ctx()
     
     # Create shared DDIM sampler ONCE (baseline optimization)
     if args.use_deepcache:
@@ -1066,7 +1110,7 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int,
                 # Use world-model in policy to generate action
                 print(f'>>> Step {itr}: generating actions ...')
                 _PERF_TIMER.start('action_generation')
-                with optional_autocast():
+                with torch.no_grad(), autocast_ctx:
                     pred_videos_0, pred_actions, _ = image_guided_synthesis_sim_mode(
                         model,
                         sample['instruction'],
@@ -1115,7 +1159,7 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int,
                 # Interaction with the world-model
                 print(f'>>> Step {itr}: interacting with world model ...')
                 _PERF_TIMER.start('world_model_interaction')
-                with optional_autocast():
+                with torch.no_grad(), autocast_ctx:
                     pred_videos_1, _, pred_states = image_guided_synthesis_sim_mode(
                         model,
                         "",

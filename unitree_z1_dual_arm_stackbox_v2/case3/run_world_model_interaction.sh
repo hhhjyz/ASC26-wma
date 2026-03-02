@@ -2,7 +2,7 @@ res_dir="unitree_z1_dual_arm_stackbox_v2/case3"
 dataset="unitree_z1_dual_arm_stackbox_v2"
 
 {
-    time CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1} python3 scripts/evaluation/world_model_interaction.py \
+    time CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} python3 scripts/evaluation/world_model_interaction.py \
         --seed 123 \
         --ckpt_path ckpts/unifolm_wma_dual.ckpt \
         --config configs/inference/world_model_interaction.yaml \
@@ -19,7 +19,6 @@ dataset="unitree_z1_dual_arm_stackbox_v2"
         --exe_steps 16 \
         --n_iter 11 \
         --timestep_spacing 'uniform_trailing' \
-        --preload_ckpt_to_shm \
         --guidance_rescale 0.7 \
         --perframe_ae \
         # --use_deepcache \

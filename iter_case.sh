@@ -1,17 +1,31 @@
 #!/usr/bin/bash
 # filepath: /pool/nvme/asc26/World_Model/team4/unifolm-world-model-action/iter_case.sh
 
-export CUDA_VISIBLE_DEVICES=1
+# 自动选择 GPU：优先使用 GPU 0，若被占用则使用 GPU 1
+if [ -z "${CUDA_VISIBLE_DEVICES+x}" ]; then
+    GPU0_USED=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i 0 2>/dev/null | tr -d ' ')
+    if [ -n "$GPU0_USED" ] && [ "$GPU0_USED" -le 10000 ]; then
+        export CUDA_VISIBLE_DEVICES=0
+    else
+        export CUDA_VISIBLE_DEVICES=1
+    fi
+    echo ">>> Auto-selected GPU: CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} (GPU0 mem used: ${GPU0_USED:-N/A} MiB)"
+fi
 export ATTN_IMPL_TYPE=xformers
 export WMA_ENABLE_TB=0
 export WMA_SAVE_INTERMEDIATE=0
 export WMA_SKIP_INIT=1
-export WMA_USE_FP16=1  # 启用 FP16 推理以提升性能，设置为 0 可禁用以提高精度
-export WMA_PROFILING=0  # 性能分析开关 (1=启用会增加 cuda.synchronize() 开销，正式测试时关闭)
+# Cast 模式选择:
+#   v1 = 旧版 (model.cuda 在 data.setup 之前, TF32 默认关闭, cudnn_benchmark 默认开启)
+#   v2 = 新版 (model.cuda 在 data.setup 之后, 支持 model.half(), TF32 默认开启)
+export WMA_CAST_MODE=v2
+export WMA_FP16=1  # FP16 开关 (1=启用)
+export WMA_FORCE_FULL_FP16=1  # 整个模型 model.half()，PSNR 最优
+export WMA_FORCE_FP16_DIFFUSION_ONLY=0  # 仅 diffusion wrapper 转 fp16 (与 FORCE_FULL 互斥)
+export WMA_PROFILING=0  # 性能分析开关
 export WMA_OPENCLIP_LOAD_PRETRAINED=0
-export WMA_CUDNN_BENCHMARK=0  # 启用 cuDNN benchmark，针对固定输入尺寸加速
-export WMA_USE_TF32=0  # 启用 TF32，A100/A6000 等 Ampere+ GPU 显著加速
-
+export WMA_CUDNN_BENCHMARK=0  # cuDNN benchmark
+export WMA_ENABLE_TF32=1  # TF32 (A100 加速)
 # 设置颜色输出
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -23,25 +37,25 @@ NC='\033[0m' # No Color
 # 格式: "任务目录/case:视频名称"
 declare -a CASES=(
     "unitree_g1_pack_camera/case1:0_full_fs6"
-    # "unitree_g1_pack_camera/case2:50_full_fs6"
-    # "unitree_g1_pack_camera/case3:100_full_fs6"
-    # "unitree_g1_pack_camera/case4:200_full_fs6"
-    # "unitree_z1_stackbox/case1:5_full_fs4"
-    # "unitree_z1_stackbox/case2:15_full_fs4"
-    # "unitree_z1_stackbox/case3:25_full_fs4"
-    # "unitree_z1_stackbox/case4:35_full_fs4"
-    # "unitree_z1_dual_arm_stackbox/case1:5_full_fs4"
-    # "unitree_z1_dual_arm_stackbox/case2:15_full_fs4"
-    # "unitree_z1_dual_arm_stackbox/case3:25_full_fs4"
-    # "unitree_z1_dual_arm_stackbox/case4:35_full_fs4"
+    "unitree_g1_pack_camera/case2:50_full_fs6"
+    "unitree_g1_pack_camera/case3:100_full_fs6"
+    "unitree_g1_pack_camera/case4:200_full_fs6"
+    "unitree_z1_stackbox/case1:5_full_fs4"
+    "unitree_z1_stackbox/case2:15_full_fs4"
+    "unitree_z1_stackbox/case3:25_full_fs4"
+    "unitree_z1_stackbox/case4:35_full_fs4"
+    "unitree_z1_dual_arm_stackbox/case1:5_full_fs4"
+    "unitree_z1_dual_arm_stackbox/case2:15_full_fs4"
+    "unitree_z1_dual_arm_stackbox/case3:25_full_fs4"
+    "unitree_z1_dual_arm_stackbox/case4:35_full_fs4"
     "unitree_z1_dual_arm_stackbox_v2/case1:5_full_fs4"
-    # "unitree_z1_dual_arm_stackbox_v2/case2:15_full_fs4"
-    # "unitree_z1_dual_arm_stackbox_v2/case3:25_full_fs4"
-    # "unitree_z1_dual_arm_stackbox_v2/case4:35_full_fs4"
-    # "unitree_z1_dual_arm_cleanup_pencils/case1:0_full_fs4"
-    # "unitree_z1_dual_arm_cleanup_pencils/case2:50_full_fs4"
-    # "unitree_z1_dual_arm_cleanup_pencils/case3:100_full_fs4"
-    # "unitree_z1_dual_arm_cleanup_pencils/case4:200_full_fs4"
+    "unitree_z1_dual_arm_stackbox_v2/case2:15_full_fs4"
+    "unitree_z1_dual_arm_stackbox_v2/case3:25_full_fs4"
+    "unitree_z1_dual_arm_stackbox_v2/case4:35_full_fs4"
+    "unitree_z1_dual_arm_cleanup_pencils/case1:0_full_fs4"
+    "unitree_z1_dual_arm_cleanup_pencils/case2:50_full_fs4"
+    "unitree_z1_dual_arm_cleanup_pencils/case3:100_full_fs4"
+    "unitree_z1_dual_arm_cleanup_pencils/case4:200_full_fs4"
 )
 
 # 结果保存目录
