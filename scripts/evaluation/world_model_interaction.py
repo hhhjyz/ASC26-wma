@@ -1,5 +1,6 @@
 import argparse, os, glob, sys
 import contextlib
+import shutil
 import pandas as pd
 import random
 import torch
@@ -48,6 +49,77 @@ _USE_TORCH_COMPILE = os.environ.get("WMA_TORCH_COMPILE", "0") == "1"
 _ACTION_DDIM_STEPS = os.environ.get("WMA_ACTION_DDIM_STEPS", "")
 # FP16 推理开关 (默认启用，设置为 0 可禁用以提高精度)
 _USE_FP16 = os.environ.get("WMA_USE_FP16", "1") == "1"
+
+
+# ===================== 优化: StageTimer =====================
+class StageTimer:
+    """Lightweight stage timer for startup/preparation profiling."""
+
+    def __init__(self, name: str, prefix: str = "prep-timer"):
+        self.name = name
+        self.prefix = prefix
+        self._start = time.perf_counter()
+        self._last = self._start
+
+    def mark(self, stage: str) -> None:
+        now = time.perf_counter()
+        step = now - self._last
+        total = now - self._start
+        print(f">>> [{self.prefix}] {self.name}.{stage}: {step:.3f}s (total {total:.3f}s)")
+        self._last = now
+
+
+# ===================== 优化: SHM 预加载 =====================
+def ensure_ckpt_preloaded_to_shm(src_path: str,
+                                 shm_dir: str = "/dev/shm/unifolm_wma_ckpts",
+                                 force_copy: bool = False) -> str:
+    """将 checkpoint 预复制到 /dev/shm 高速内存，加速 torch.load。
+    
+    为避免多用户权限冲突，自动在 shm_dir 下按用户名隔离子目录。
+    """
+    import getpass
+    src_abs = os.path.abspath(os.path.expanduser(src_path))
+    # 每个用户使用独立子目录，避免 Permission denied
+    user = getpass.getuser()
+    shm_dir_abs = os.path.abspath(os.path.join(os.path.expanduser(shm_dir), user))
+    shm_real = os.path.realpath(shm_dir_abs)
+    src_real = os.path.realpath(src_abs)
+    if src_real == shm_real or src_real.startswith(shm_real + os.sep):
+        print(f">>> [shm] checkpoint already in shm: {src_abs}")
+        return src_abs
+
+    os.makedirs(shm_dir_abs, exist_ok=True)
+    dst_abs = os.path.join(shm_dir_abs, os.path.basename(src_abs))
+    if os.path.exists(dst_abs) and not force_copy:
+        # 额外检查可读性，防止残留的无权限文件
+        if os.access(dst_abs, os.R_OK):
+            print(f">>> [shm] reuse preloaded checkpoint: {dst_abs}")
+            return dst_abs
+        else:
+            print(f">>> [shm] cached file not readable, re-copying: {dst_abs}")
+            try:
+                os.remove(dst_abs)
+            except OSError:
+                pass
+
+    src_size = os.path.getsize(src_abs)
+    free_bytes = shutil.disk_usage(shm_dir_abs).free
+    if free_bytes < src_size:
+        print(f">>> [shm] insufficient shm space (need {src_size}, free {free_bytes}), fallback to source ckpt.")
+        return src_abs
+
+    tmp_abs = dst_abs + ".tmp"
+    copy_start = time.perf_counter()
+    with open(src_abs, "rb", buffering=0) as src_f, \
+         open(tmp_abs, "wb", buffering=0) as dst_f:
+        shutil.copyfileobj(src_f, dst_f, length=64 * 1024 * 1024)
+        dst_f.flush()
+        os.fsync(dst_f.fileno())
+    os.replace(tmp_abs, dst_abs)
+    elapsed = max(time.perf_counter() - copy_start, 1e-6)
+    speed_mb_s = (src_size / (1024 * 1024)) / elapsed
+    print(f">>> [shm] preloaded checkpoint to shm: {dst_abs} ({elapsed:.2f}s, {speed_mb_s:.1f} MB/s)")
+    return dst_abs
 
 
 # ===================== 优化: 性能计时 =====================
@@ -273,27 +345,41 @@ def get_filelist(data_dir: str, postfixes: list[str]) -> list[str]:
 
 
 def load_model_checkpoint(model: nn.Module, ckpt: str, 
-                          use_optimized: bool = True,
-                          target_device: Optional[torch.device] = None) -> nn.Module:
+                          map_location: str = "cpu") -> nn.Module:
     """Load model weights from checkpoint file.
 
     Args:
         model (nn.Module): Model instance.
         ckpt (str): Path to the checkpoint file.
-        use_optimized (bool): 使用优化的加载方式
-        target_device: 目标设备，可直接加载到 GPU 避免 CPU→GPU 拷贝
+        map_location: 'cpu' or 'cuda:X'. GPU 直接加载在本地 NVMe 上更快，
+                      但在 CephFS 网络存储上 CPU 加载更快。
 
     Returns:
         nn.Module: Model with loaded weights.
     """
-    if use_optimized:
-        state_dict = load_checkpoint_optimized(ckpt, target_device=target_device)
-    else:
-        map_loc = target_device if target_device else "cpu"
-        state_dict = torch.load(ckpt, map_location=map_loc)
-        if "state_dict" in list(state_dict.keys()):
-            state_dict = state_dict["state_dict"]
-    
+    t0 = time.perf_counter()
+    state_dict = torch.load(ckpt, map_location=map_location, weights_only=False)
+    t1 = time.perf_counter()
+    print(f'>>> [ckpt] torch.load({map_location}): {t1-t0:.2f}s')
+
+    if "state_dict" in state_dict:
+        state_dict = state_dict["state_dict"]
+
+    # Optional verification to detect missing keys / mismatches that can
+    # cause quality regressions (enable with WMA_VERIFY_CKPT_MATCH=1).
+    verify = os.environ.get("WMA_VERIFY_CKPT_MATCH", "0") == "1"
+
+    if verify:
+        # Compare keys and shapes before loading
+        model_keys = set(model.state_dict().keys())
+        ckpt_keys = set(state_dict.keys())
+        missing_in_model = ckpt_keys - model_keys
+        unexpected_in_model = model_keys - ckpt_keys
+        if missing_in_model:
+            print(f">>> [verify] Warning: {len(missing_in_model)} ckpt keys not found in model (examples: {list(missing_in_model)[:5]})")
+        if unexpected_in_model:
+            print(f">>> [verify] Note: {len(unexpected_in_model)} model keys missing in ckpt (examples: {list(unexpected_in_model)[:5]})")
+
     try:
         model.load_state_dict(state_dict, strict=True)
     except Exception:
@@ -307,7 +393,36 @@ def load_model_checkpoint(model: nn.Module, ckpt: str,
                 new_pl_sd[new_key] = new_pl_sd[k]
                 del new_pl_sd[k]
         model.load_state_dict(new_pl_sd, strict=True)
-    
+
+    if verify:
+        # Compute a lightweight aggregate L2 difference between ckpt tensors and
+        # model parameters to catch silent mismatches (run on CPU to avoid GPU
+        # memory blowup). If anything non-zero appears it indicates keys were
+        # not fully applied or shapes mismatched.
+        total_sq = 0.0
+        count = 0
+        for k, ckpt_v in state_dict.items():
+            try:
+                model_v = model.state_dict()[k]
+            except KeyError:
+                continue
+            # move to cpu and numeric check
+            ck = ckpt_v.detach().cpu().to(torch.float32)
+            mv = model_v.detach().cpu().to(torch.float32)
+            if ck.shape != mv.shape:
+                print(f">>> [verify] shape mismatch for {k}: ckpt={ck.shape}, model={mv.shape}")
+                total_sq += 1.0
+                count += 1
+                continue
+            diff = (ck - mv).float()
+            total_sq += float(torch.sum(diff * diff).item())
+            count += ck.numel()
+        if count > 0:
+            rmse = math.sqrt(total_sq / max(1, count))
+            print(f">>> [verify] checkpoint vs model RMSE={rmse:.6e} (over {count} elements)")
+            if rmse > 1e-6:
+                print(">>> [verify] Warning: non-zero RMSE indicates parameters may not match checkpoint exactly.")
+
     print('>>> model checkpoint loaded.')
     return model
 
@@ -733,41 +848,69 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int,
         model = cached_model
         print(f'>>> 复用已加载的模型实例')
     else:
+        startup_timer = StageTimer("init")
+        
         # Load config
         config = OmegaConf.load(args.config)
         config['model']['params']['wma_config']['params']['use_checkpoint'] = False
+        startup_timer.mark("load_config")
         
-        # 使用跳过初始化的上下文
+        # ── 解析初始化策略参数 ──
         skip_init = os.environ.get("WMA_SKIP_INIT", "1") == "1"
-        print(f'>>> 模型实例化 (skip_init={skip_init})...')
-        t0 = time.perf_counter()
-        with skip_module_init_context(skip_init):
-            model = instantiate_from_config(config.model)
-        print(f'>>> 模型实例化完成 ({time.perf_counter() - t0:.2f}s)')
+        init_model_device = getattr(args, 'init_model_device', 'cpu')
+        checkpoint_load_device = getattr(args, 'checkpoint_load_device', 'cpu')
+        preload_ckpt_to_shm = getattr(args, 'preload_ckpt_to_shm', False)
+        preload_shm_dir = getattr(args, 'preload_shm_dir', '/dev/shm/unifolm_wma_ckpts')
+        
+        print(f'>>> [init] skip_param_init={skip_init}, init_model_device={init_model_device}, '
+              f'checkpoint_load_device={checkpoint_load_device}, preload_shm={preload_ckpt_to_shm}')
+        
+        # ── Step 1: 模型实例化 (跳过权重初始化 + 可选 GPU 直接构建) ──
+        print(f'>>> 模型实例化 (skip_init={skip_init}, device={init_model_device})...')
+        if init_model_device == "gpu" and torch.cuda.is_available():
+            torch.cuda.set_device(gpu_no)
+            with torch.device(f"cuda:{gpu_no}"):
+                with skip_module_init_context(skip_init):
+                    model = instantiate_from_config(config.model)
+        else:
+            with skip_module_init_context(skip_init):
+                model = instantiate_from_config(config.model)
+        startup_timer.mark("instantiate_model")
         
         model.perframe_ae = args.perframe_ae
         assert os.path.exists(args.ckpt_path), "Error: checkpoint Not Found!"
         
-        # 优化: 直接加载 checkpoint 到 GPU (避免 CPU→GPU 拷贝)
-        load_to_gpu = os.environ.get("WMA_CKPT_LOAD_TO_GPU", "1") == "1"
-        if load_to_gpu and torch.cuda.is_available():
-            # 先将空模型移到 GPU，再加载 checkpoint 到 GPU
+        # ── Step 2: 可选 SHM 预加载 ──
+        ckpt_path = args.ckpt_path
+        if preload_ckpt_to_shm:
+            ckpt_path = ensure_ckpt_preloaded_to_shm(args.ckpt_path, preload_shm_dir)
+            startup_timer.mark("preload_ckpt_to_shm")
+        
+        # ── Step 3: 加载 checkpoint ──
+        preloaded_to_gpu = (init_model_device == "gpu") and torch.cuda.is_available()
+        ckpt_map_location = "cpu"
+        
+        if checkpoint_load_device == "gpu" and torch.cuda.is_available():
+            torch.cuda.set_device(gpu_no)
+            ckpt_map_location = f"cuda:{gpu_no}"
+            # 如果模型还在 CPU，先搬到 GPU
+            if not preloaded_to_gpu:
+                print(f'>>> 模型移动到 GPU {gpu_no} (for ckpt direct load)...')
+                model = model.cuda(gpu_no)
+                startup_timer.mark("move_model_to_gpu_for_ckpt")
+                preloaded_to_gpu = True
+        
+        print(f'>>> 加载 checkpoint (map_location={ckpt_map_location})...')
+        model = load_model_checkpoint(model, ckpt_path, map_location=ckpt_map_location)
+        startup_timer.mark("load_checkpoint")
+        
+        # ── Step 4: 搬到 GPU (如果还没在 GPU 上) ──
+        if not preloaded_to_gpu:
             print(f'>>> 模型移动到 GPU {gpu_no}...')
-            t0 = time.perf_counter()
             model = model.cuda(gpu_no)
-            print(f'>>> 模型移动完成 ({time.perf_counter() - t0:.2f}s)')
-            
-            target_device = torch.device(f"cuda:{gpu_no}")
-            print(f'>>> 加载 checkpoint 到 GPU...')
-            t0 = time.perf_counter()
-            model = load_model_checkpoint(model, args.ckpt_path, target_device=target_device)
-            print(f'>>> Checkpoint 加载完成 ({time.perf_counter() - t0:.2f}s)')
+            startup_timer.mark("move_model_to_gpu")
         else:
-            # 传统方式: CPU 加载后移到 GPU
-            print(f'>>> 加载 checkpoint 到 CPU...')
-            t0 = time.perf_counter()
-            model = load_model_checkpoint(model, args.ckpt_path)
-            print(f'>>> Checkpoint 加载完成 ({time.perf_counter() - t0:.2f}s)')
+            startup_timer.mark("model_already_on_gpu")
         
         model.eval()
         
@@ -807,6 +950,11 @@ def run_inference(args: argparse.Namespace, gpu_num: int, gpu_no: int,
     else:
         shared_ddim_sampler = DDIMSampler(model)
     print(f'>>> Created shared DDIM sampler')
+
+    # NOTE: 不要在这里再次 seed_everything！
+    # data.setup() 内部已经调用了 seed_everything(123) 重置 RNG，
+    # 到这里 RNG 状态已经与参考代码一致。
+    # 如果多 seed 一次会改变采样噪声，导致 PSNR 下降 ~2dB。
 
     # Run over data
     assert (args.height % 16 == 0) and (
@@ -1181,6 +1329,33 @@ def get_parser():
         default=0,
         help="DeepCache: Block level to start caching. 0 = most aggressive, higher = more conservative."
     )
+    # ===================== 初始化优化参数 =====================
+    parser.add_argument(
+        "--init_model_device",
+        type=str,
+        default="cpu",
+        choices=["cpu", "gpu"],
+        help="Model init device. 'gpu' constructs model parameters directly on CUDA."
+    )
+    parser.add_argument(
+        "--checkpoint_load_device",
+        type=str,
+        default="cpu",
+        choices=["cpu", "gpu"],
+        help="Checkpoint load device. 'gpu' loads checkpoint tensors directly on CUDA."
+    )
+    parser.add_argument(
+        "--preload_ckpt_to_shm",
+        action='store_true',
+        default=False,
+        help="Preload checkpoint to /dev/shm before torch.load for faster IO."
+    )
+    parser.add_argument(
+        "--preload_shm_dir",
+        type=str,
+        default="/dev/shm/unifolm_wma_ckpts",
+        help="Target shm directory for checkpoint preload."
+    )
     return parser
 
 
@@ -1190,6 +1365,7 @@ if __name__ == '__main__':
     seed = args.seed
     if seed < 0:
         seed = random.randint(0, 2**31)
+    args.seed = seed
     seed_everything(seed)
     rank, gpu_num = 0, 1
     run_inference(args, gpu_num, rank)

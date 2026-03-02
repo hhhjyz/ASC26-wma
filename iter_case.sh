@@ -1,13 +1,15 @@
 #!/usr/bin/bash
 # filepath: /pool/nvme/asc26/World_Model/team4/unifolm-world-model-action/iter_case.sh
 
+export CUDA_VISIBLE_DEVICES=1
 export ATTN_IMPL_TYPE=xformers
 export WMA_ENABLE_TB=0
 export WMA_SAVE_INTERMEDIATE=0
 export WMA_SKIP_INIT=1
 export WMA_USE_FP16=1  # 启用 FP16 推理以提升性能，设置为 0 可禁用以提高精度
 export WMA_PROFILING=0  # 性能分析开关 (1=启用会增加 cuda.synchronize() 开销，正式测试时关闭)
-export WMA_CUDNN_BENCHMARK=1  # 启用 cuDNN benchmark，针对固定输入尺寸加速
+export WMA_OPENCLIP_LOAD_PRETRAINED=0
+export WMA_CUDNN_BENCHMARK=0  # 启用 cuDNN benchmark，针对固定输入尺寸加速
 export WMA_USE_TF32=0  # 启用 TF32，A100/A6000 等 Ampere+ GPU 显著加速
 
 # 设置颜色输出
@@ -32,7 +34,7 @@ declare -a CASES=(
     # "unitree_z1_dual_arm_stackbox/case2:15_full_fs4"
     # "unitree_z1_dual_arm_stackbox/case3:25_full_fs4"
     # "unitree_z1_dual_arm_stackbox/case4:35_full_fs4"
-    # "unitree_z1_dual_arm_stackbox_v2/case1:5_full_fs4"
+    "unitree_z1_dual_arm_stackbox_v2/case1:5_full_fs4"
     # "unitree_z1_dual_arm_stackbox_v2/case2:15_full_fs4"
     # "unitree_z1_dual_arm_stackbox_v2/case3:25_full_fs4"
     # "unitree_z1_dual_arm_stackbox_v2/case4:35_full_fs4"

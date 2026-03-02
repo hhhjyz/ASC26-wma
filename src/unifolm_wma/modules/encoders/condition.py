@@ -3,6 +3,8 @@ import torch.nn as nn
 import kornia
 import open_clip
 import math
+import os
+import threading
 
 from torch.utils.checkpoint import checkpoint
 from transformers import T5Tokenizer, T5EncoderModel, CLIPTokenizer, CLIPTextModel
@@ -10,6 +12,41 @@ from transformers import T5Tokenizer, T5EncoderModel, CLIPTokenizer, CLIPTextMod
 from unifolm_wma.utils.common import autocast
 from unifolm_wma.utils.utils import count_params
 from unifolm_wma.modules.encoders.resampler import reshape_tensor
+
+
+# ===================== OpenCLIP 加载优化 =====================
+# 推理时 checkpoint 已包含所有权重，跳过 pretrained 加载可节省 ~15s
+# 设为 "0" 可跳过 pretrained 权重加载（推理时推荐）
+_OPENCLIP_LOAD_PRETRAINED = os.environ.get("WMA_OPENCLIP_LOAD_PRETRAINED", "1") == "1"
+# 共享 OpenCLIP base model 缓存（避免重复加载 3.7GB 权重）
+_OPENCLIP_SHARED_CACHE = {}
+_OPENCLIP_SHARED_LOCK = threading.Lock()
+
+
+def _get_or_create_openclip_model(arch: str, version: str):
+    """
+    加载 OpenCLIP 模型，支持缓存共享。
+    推理时如果 WMA_OPENCLIP_LOAD_PRETRAINED=0，则只创建模型结构不加载预训练权重。
+    """
+    load_pretrained = _OPENCLIP_LOAD_PRETRAINED
+    cache_key = (arch, version, load_pretrained)
+
+    with _OPENCLIP_SHARED_LOCK:
+        if cache_key in _OPENCLIP_SHARED_CACHE:
+            import copy
+            return copy.deepcopy(_OPENCLIP_SHARED_CACHE[cache_key])
+
+    pretrained_arg = version if load_pretrained else None
+    model, _, _ = open_clip.create_model_and_transforms(
+        arch, device=torch.device('cpu'), pretrained=pretrained_arg)
+    model = model.eval()
+    for p in model.parameters():
+        p.requires_grad = False
+
+    with _OPENCLIP_SHARED_LOCK:
+        _OPENCLIP_SHARED_CACHE[cache_key] = model
+        import copy
+        return copy.deepcopy(model)
 
 
 class AbstractEncoder(nn.Module):
@@ -221,8 +258,7 @@ class FrozenOpenCLIPEmbedder(AbstractEncoder):
                  layer="last"):
         super().__init__()
         assert layer in self.LAYERS
-        model, _, _ = open_clip.create_model_and_transforms(
-            arch, device=torch.device('cpu'), pretrained=version)
+        model = _get_or_create_openclip_model(arch, version)
         del model.visual
         self.model = model
 
@@ -288,11 +324,7 @@ class FrozenOpenCLIPImageEmbedder(AbstractEncoder):
                  antialias=True,
                  ucg_rate=0.):
         super().__init__()
-        model, _, _ = open_clip.create_model_and_transforms(
-            arch,
-            device=torch.device('cpu'),
-            pretrained=version,
-        )
+        model = _get_or_create_openclip_model(arch, version)
         del model.transformer
         self.model = model
         # self.mapper = torch.nn.Linear(1280, 1024)
@@ -363,11 +395,7 @@ class FrozenOpenCLIPImageEmbedderV2(AbstractEncoder):
                  layer="pooled",
                  antialias=True):
         super().__init__()
-        model, _, _ = open_clip.create_model_and_transforms(
-            arch,
-            device=torch.device('cpu'),
-            pretrained=version,
-        )
+        model = _get_or_create_openclip_model(arch, version)
         del model.transformer
         self.model = model
         self.device = device
